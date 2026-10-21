@@ -6,7 +6,7 @@ DB tests skip automatically if data/torob.sqlite has not been built.
 import os
 import unittest
 
-from tehran_agent.normalize import normalize_text, parse_budget_toman, clean_null
+from tehran_agent.normalize import clean_null, normalize_text, parse_budget_toman
 from tehran_agent.tools import Filters, ShoppingTools, haversine_km, resolve_location
 
 DB = os.path.join(os.path.dirname(__file__), "..", "data", "torob.sqlite")
@@ -129,6 +129,49 @@ class DatabaseTests(unittest.TestCase):
         s = self.t.find_shops(Filters(limit=3))
         for shop in s["shops"]:
             self.assertTrue(shop["name_is_synthetic_warning"])
+
+    def test_search_applies_brand_filter(self):
+        seed = self.t.search_products("ماوس", Filters(limit=50))
+        if not seed["items"]:
+            self.skipTest("no products for query")
+        brand = next((i["brand"] for i in seed["items"] if i["brand"]), None)
+        if not brand:
+            self.skipTest("no brand in sample set")
+        r = self.t.search_products("ماوس", Filters(brand=brand, limit=30))
+        for item in r["items"]:
+            self.assertEqual(item["brand"], brand)
+
+    def test_search_applies_category_filter(self):
+        seed = self.t.search_products("ماوس", Filters(limit=50))
+        if not seed["items"]:
+            self.skipTest("no products for query")
+        category = next((i["category"] for i in seed["items"] if i["category"]), None)
+        if not category:
+            self.skipTest("no category in sample set")
+        r = self.t.search_products("ماوس", Filters(category=category, limit=30))
+        for item in r["items"]:
+            self.assertEqual(item["category"], category)
+
+    def test_wireless_query_avoids_wired_tokens(self):
+        r = self.t.search_products("ماوس بی سیم", Filters(limit=30))
+        for item in r["items"]:
+            title = normalize_text(item["title"])
+            self.assertNotIn("با سیم", title)
+
+    def test_find_alternatives_sorted_by_cheapest_first(self):
+        seed = self.t.search_products("ماوس", Filters(limit=1))
+        if not seed["items"]:
+            self.skipTest("no products for query")
+        pid = seed["items"][0]["product_id"]
+        alts = self.t.find_alternatives(pid, limit=10)
+        prices = [a["min_price"] for a in alts["alternatives"]]
+        self.assertEqual(prices, sorted(prices))
+
+    def test_plan_trip_returns_unmatched_for_unknown_product(self):
+        data = self.t.plan_shopping_trip([
+            {"product_id": "product_doesnotexist"},
+        ])
+        self.assertIn("product_doesnotexist", data["unmatched_product_ids"])
 
 
 if __name__ == "__main__":

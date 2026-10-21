@@ -1,6 +1,10 @@
 __pycache__/
 *.pyc
-data/raw/
 data/*.sqlite
+
+data/raw/*
+!data/raw/.gitkeep
+!data/raw/starcoach-dataset-v16-cap300-csv.zip
+
 .env
 node_modules/
