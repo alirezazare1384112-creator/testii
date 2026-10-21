@@ -41,12 +41,12 @@ class Filters:
     near: tuple[float, float] | None = None
     radius_km: float | None = None
     fast_delivery: bool | None = None
-    sort: str = "relevance"  # relevance | price_asc | price_desc | distance
+    sort: str = "relevance"  # relevance | matching_offers | price_asc | price_desc | distance
     limit: int = 20
     offset: int = 0
 
     def validate(self) -> None:
-        if self.sort not in {"relevance", "price_asc", "price_desc", "distance"}:
+        if self.sort not in {"relevance", "matching_offers", "price_asc", "price_desc", "distance"}:
             raise ValueError(f"invalid sort: {self.sort}")
         if self.min_price is not None and self.max_price is not None and self.min_price > self.max_price:
             raise ValueError("min_price > max_price")
@@ -79,6 +79,16 @@ def resolve_location(text: str | None) -> tuple[float, float] | None:
     return None
 
 
+def _connection_mode(q_norm: str) -> str | None:
+    has_wireless = "بی سیم" in q_norm or "wireless" in q_norm
+    has_wired = "با سیم" in q_norm or "سیمی" in q_norm or "wired" in q_norm
+    if has_wireless and not has_wired:
+        return "wireless"
+    if has_wired and not has_wireless:
+        return "wired"
+    return None
+
+
 class ShoppingTools:
     def __init__(self, db_path: str = DEFAULT_DB):
         self.con = sqlite3.connect(db_path)
@@ -91,24 +101,57 @@ class ShoppingTools:
     def search_products(self, query: str, filters: Filters | None = None) -> dict[str, Any]:
         f = filters or Filters()
         f.validate()
-        terms = [t for t in normalize_text(query).split() if len(t) > 1]
-        if not terms:
+
+        q_norm = normalize_text(query)
+        connection = _connection_mode(q_norm)
+        terms = [t for t in q_norm.split() if len(t) > 1]
+        if connection is not None:
+            terms = [t for t in terms if t not in {"بی", "با", "سیم", "سیمی", "wireless", "wired"}]
+
+        if not terms and connection is None:
             return _result([], 0, f, "empty_query")
 
         where, params = [], []
-        for t in terms:
-            where.append("p.title_norm LIKE ?")
-            params.append(f"%{t}%")
+        if terms:
+            for t in terms:
+                where.append("p.title_norm LIKE ?")
+                params.append(f"%{t}%")
+
+        if connection == "wireless":
+            where.append("(p.title_norm LIKE ? OR p.title_norm LIKE ?)")
+            params += ["%بی سیم%", "%wireless%"]
+            where.append("p.title_norm NOT LIKE ?")
+            params.append("%با سیم%")
+        elif connection == "wired":
+            where.append("(p.title_norm LIKE ? OR p.title_norm LIKE ? OR p.title_norm LIKE ?)")
+            params += ["%با سیم%", "%سیمی%", "%wired%"]
+
+        if f.brand:
+            where.append("p.brand = ?")
+            params.append(f.brand)
+
+        if f.category:
+            where.append("p.category = ?")
+            params.append(f.category)
+
+        where_sql = " AND ".join(where) if where else "1=1"
+
         # Offer-level filters are applied via EXISTS so the product must have a
         # qualifying offer.
         offer_conds, offer_params = self._offer_conditions(f)
         offer_clause = f"AND EXISTS (SELECT 1 FROM offers o WHERE o.product_id = p.product_id {offer_conds})"
-        where_sql = " AND ".join(where)
 
         total = self.con.execute(
             f"SELECT COUNT(*) FROM products p WHERE {where_sql} {offer_clause}",
             params + offer_params,
         ).fetchone()[0]
+
+        if f.sort == "price_desc":
+            order_sql = "min_price IS NULL, min_price DESC, p.title"
+        elif f.sort == "matching_offers":
+            order_sql = "offer_count DESC, min_price IS NULL, min_price ASC, p.title"
+        else:
+            order_sql = "min_price IS NULL, min_price ASC, p.title"
 
         rows = self.con.execute(
             f"""
@@ -119,10 +162,10 @@ class ShoppingTools:
                    p.image_urls
             FROM products p
             WHERE {where_sql} {offer_clause}
-            ORDER BY min_price IS NULL, min_price ASC, p.title
+            ORDER BY {order_sql}
             LIMIT ? OFFSET ?
             """,
-            # placeholder order: SELECT subqueries (2x offer), WHERE terms, EXISTS offer, LIMIT/OFFSET
+            # placeholder order: SELECT subqueries (2x offer), WHERE params, EXISTS offer, LIMIT/OFFSET
             offer_params + offer_params + params + offer_params + [f.limit, f.offset],
         ).fetchall()
 
@@ -147,8 +190,10 @@ class ShoppingTools:
         if f.max_price is not None:
             conds.append("AND o.price_status = 'ok' AND o.price_toman <= ?")
             params.append(f.max_price)
-        if f.fast_delivery:
+        if f.fast_delivery is True:
             conds.append("AND o.shop_id IN (SELECT shop_id FROM shops WHERE supports_fast_delivery = 1)")
+        elif f.fast_delivery is False:
+            conds.append("AND o.shop_id IN (SELECT shop_id FROM shops WHERE supports_fast_delivery = 0)")
         if f.near is not None:
             lat, lon = f.near
             radius = f.radius_km or 5.0
@@ -248,15 +293,27 @@ class ShoppingTools:
         if location is not None:
             f.near = location
         f.validate()
-        conds, params = self._offer_conditions(Filters(max_price=f.max_price, min_price=f.min_price,
-                                                       fast_delivery=f.fast_delivery))
+
+        conds, params = self._offer_conditions(Filters(
+            max_price=f.max_price,
+            min_price=f.min_price,
+            fast_delivery=f.fast_delivery,
+            near=f.near,
+            radius_km=f.radius_km,
+        ))
+
         if f.category:
             conds += " AND o.product_id IN (SELECT product_id FROM products WHERE category = ?)"
             params.append(f.category)
+        if f.brand:
+            conds += " AND o.product_id IN (SELECT product_id FROM products WHERE brand = ?)"
+            params.append(f.brand)
+
         rows = self.con.execute(
             f"""
             SELECT s.shop_id, s.name, s.address, s.location_label, s.lat, s.lon,
-                   s.supports_fast_delivery, COUNT(o.offer_id) AS matching_offers
+                   s.supports_fast_delivery, COUNT(o.offer_id) AS matching_offers,
+                   MIN(CASE WHEN o.price_status = 'ok' THEN o.price_toman END) AS best_price_toman
             FROM shops s JOIN offers o ON o.shop_id = s.shop_id
             WHERE 1=1 {conds}
             GROUP BY s.shop_id
@@ -265,6 +322,7 @@ class ShoppingTools:
             """,
             params,
         ).fetchall()
+
         shops = []
         for r in rows:
             d = None
@@ -281,11 +339,20 @@ class ShoppingTools:
                 "lon": r["lon"],
                 "supports_fast_delivery": _bool_or_none(r["supports_fast_delivery"]),
                 "matching_offers": r["matching_offers"],
+                "best_price_toman": r["best_price_toman"],
                 "distance_km": d,
                 "name_is_synthetic_warning": True,
             })
+
         if f.sort == "distance" and f.near is not None:
             shops.sort(key=lambda s: (s["distance_km"] is None, s["distance_km"] or 0))
+        elif f.sort == "price_asc":
+            shops.sort(key=lambda s: (s["best_price_toman"] is None, s["best_price_toman"] or 0, -s["matching_offers"]))
+        elif f.sort == "price_desc":
+            shops.sort(key=lambda s: (s["best_price_toman"] is None, -(s["best_price_toman"] or 0), -s["matching_offers"]))
+        else:
+            shops.sort(key=lambda s: (-s["matching_offers"], s["distance_km"] if s["distance_km"] is not None else 10**9))
+
         return {"status": "ok" if shops else "no_results", "total": len(shops),
                 "shops": shops[f.offset:f.offset + f.limit]}
 
@@ -314,7 +381,7 @@ class ShoppingTools:
             WHERE p.category = ? AND p.product_id != ?
             GROUP BY p.product_id
             {budget_sql}
-            ORDER BY min_price DESC
+            ORDER BY min_price ASC
             LIMIT ?
             """,
             params + [limit],

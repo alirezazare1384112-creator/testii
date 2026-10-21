@@ -4,17 +4,20 @@ Stdlib only (csv + sqlite3). Raw CSVs are never modified.
 
 Usage:
     python -m tehran_agent.importer --src data/raw/torob-dataset --db data/torob.sqlite
+    python -m tehran_agent.importer --src data/raw/torob-dataset-v16-cap300-csv.zip --db data/torob.sqlite
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import datetime as dt
+import io
 import os
 import sqlite3
 import sys
+import zipfile
 
-from .normalize import normalize_text, clean_null
+from .normalize import clean_null, normalize_text
 
 csv.field_size_limit(10**9)
 
@@ -78,9 +81,30 @@ CREATE INDEX idx_shops_geo ON shops(lat, lon);
 """
 
 
-def _rows(path: str):
-    with open(path, encoding="utf-8", newline="") as f:
-        yield from csv.DictReader(f)
+def _resolve_member(zf: zipfile.ZipFile, filename: str) -> str:
+    target = filename.lower()
+    matches = [name for name in zf.namelist() if name.lower() == target or name.lower().endswith("/" + target)]
+    if not matches:
+        raise FileNotFoundError(f"{filename} not found inside {zf.filename}")
+    # Prefer shortest path (root-level files win if available).
+    return sorted(matches, key=len)[0]
+
+
+def _rows(src: str, filename: str):
+    if os.path.isdir(src):
+        with open(os.path.join(src, filename), encoding="utf-8-sig", newline="") as f:
+            yield from csv.DictReader(f)
+        return
+
+    if zipfile.is_zipfile(src):
+        with zipfile.ZipFile(src) as zf:
+            member = _resolve_member(zf, filename)
+            with zf.open(member, "r") as raw:
+                text = io.TextIOWrapper(raw, encoding="utf-8-sig", newline="")
+                yield from csv.DictReader(text)
+        return
+
+    raise FileNotFoundError(f"source must be a directory or zip file: {src}")
 
 
 def classify_price(raw: str | None) -> tuple[float | None, str]:
@@ -120,7 +144,7 @@ def import_dataset(src: str, db_path: str) -> dict:
     # Shops (Tehran bounding box from audit: lat 35.5-36.0, lon 51.0-51.7)
     shop_ids = set()
     batch = []
-    for r in _rows(os.path.join(src, "shops.csv")):
+    for r in _rows(src, "shops.csv"):
         shop_ids.add(r["shop_id"])
         batch.append((
             r["shop_id"], clean_null(r["name"]) or "", clean_null(r["address"]),
@@ -137,7 +161,7 @@ def import_dataset(src: str, db_path: str) -> dict:
     # Products
     product_ids = set()
     batch = []
-    for r in _rows(os.path.join(src, "products.csv")):
+    for r in _rows(src, "products.csv"):
         title = clean_null(r["persian_title"]) or ""
         product_ids.add(r["product_id"])
         specs = clean_null(r["specs"]) or "[]"
@@ -156,7 +180,7 @@ def import_dataset(src: str, db_path: str) -> dict:
 
     # Offers
     batch, skipped = [], {"unknown_product": 0, "unknown_shop": 0}
-    for r in _rows(os.path.join(src, "offers.csv")):
+    for r in _rows(src, "offers.csv"):
         if r["product_id"] not in product_ids:
             skipped["unknown_product"] += 1
             continue
@@ -180,7 +204,8 @@ def import_dataset(src: str, db_path: str) -> dict:
 
     meta = {
         "imported_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "source_dir": os.path.abspath(src),
+        "source": os.path.abspath(src),
+        "source_type": "zip" if zipfile.is_zipfile(src) else "directory",
         "price_bounds_toman": f"{PRICE_MIN_OK}..{PRICE_MAX_OK}",
         **{f"count_{k}": str(v) for k, v in counts.items()},
     }
