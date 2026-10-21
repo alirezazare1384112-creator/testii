@@ -1,0 +1,56 @@
+/** Shared helpers for the /api/* routes over the torob SQLite tools. */
+import { NextResponse } from "next/server";
+import { getTools, type Filters } from "@/lib/torob";
+import { resolveLocation } from "@/lib/torob";
+
+export function json(data: unknown, status = 200) {
+  return NextResponse.json(data, { status });
+}
+
+export function errorJson(message: string, status = 400, code?: string) {
+  return NextResponse.json({ error: message, code: code ?? "bad_request" }, { status });
+}
+
+function num(v: string | null): number | null {
+  if (v === null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function bool(v: string | null): boolean | null {
+  if (v === null) return null;
+  if (v === "1" || v.toLowerCase() === "true") return true;
+  if (v === "0" || v.toLowerCase() === "false") return false;
+  return null;
+}
+
+/** Parse the common filter query params into a Filters object. */
+export function parseFilters(sp: URLSearchParams): Filters {
+  const near = sp.get("near");
+  const loc = near ? resolveLocation(near) : null;
+  const f: Filters = {
+    min_price: num(sp.get("min_price")),
+    max_price: num(sp.get("max_price")),
+    brand: sp.get("brand") || null,
+    category: sp.get("category") || null,
+    near: loc,
+    radius_km: num(sp.get("radius_km")),
+    fast_delivery: bool(sp.get("fast_delivery")),
+    sort: (sp.get("sort") as Filters["sort"]) || "relevance",
+    limit: Number(sp.get("limit") ?? 20),
+    offset: Number(sp.get("offset") ?? 0),
+  };
+  // also allow explicit lat/lon override
+  const lat = num(sp.get("lat"));
+  const lon = num(sp.get("lon"));
+  if (lat !== null && lon !== null && !loc) f.near = [lat, lon];
+  return f;
+}
+
+export function handleToolError(e: unknown) {
+  const msg = e instanceof Error ? e.message : String(e);
+  const isValidation = /invalid|outside|max_price|min_price|budget|items must|sort/i.test(msg);
+  return errorJson(msg, isValidation ? 400 : 500, isValidation ? "validation_error" : "server_error");
+}
+
+export { getTools };
